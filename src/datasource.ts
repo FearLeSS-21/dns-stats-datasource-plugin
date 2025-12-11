@@ -22,6 +22,7 @@ import {
   GCPoint,
   ZoneResponse,
   GCGranularity,
+  ZonesApiResponse,
 } from "./types";
 import { createLabelInfo, getEmptyDataFrame, getTimeField, getValueField, getValueVariable } from "./utils";
 import { getUnit } from "./unit";
@@ -30,16 +31,17 @@ import { defaultQuery, defaultVariableQuery } from "./defaults";
 
 export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
   url?: string;
+  // ← store instanceSettings so it's available on 'this'
+  private instanceSettings: DataSourceInstanceSettings<GCDataSourceOptions>;
 
   constructor(instanceSettings: DataSourceInstanceSettings<GCDataSourceOptions>) {
     super(instanceSettings);
     this.url = instanceSettings.url;
+    this.instanceSettings = instanceSettings;
   }
 
   async metricFindQuery(query: GCVariableQuery): Promise<MetricFindValue[]> {
-    if (!query.selector?.value) {
-      query.selector = defaultVariableQuery.selector!;
-    }
+    query.selector = query.selector || defaultVariableQuery.selector!;
 
     switch (query.selector.value) {
       case GCVariable.Zone: {
@@ -49,34 +51,33 @@ export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
       case GCVariable.RecordType: {
         return getValueVariable(Object.values(GCDNSRecordType));
       }
-      default: {
+      default:
         return [];
-      }
     }
   }
 
   private async getAllZones(): Promise<ZoneResponse[]> {
     const limit = 1000;
-    const getZones = (offset = 0) =>
-      getBackendSrv().datasourceRequest<{ results: ZoneResponse[]; count: number }>({
+    const fetchZones = (offset = 0) =>
+      getBackendSrv().datasourceRequest<ZonesApiResponse>({
         method: "GET",
         url: `${this.url}/zones`,
         responseType: "json",
         params: { limit, offset },
       });
 
-    const first = await getZones(0);
-    const { count, results } = first.data;
+    const first = await fetchZones(0);
+    const { total_amount, zones } = first.data;
 
-    if (count <= limit) {
-      return results;
-    }
+    if (total_amount <= limit) return zones;
 
     const rest = await Promise.all(
-      Array.from({ length: Math.ceil(count / limit) - 1 }, (_, i) => getZones((i + 1) * limit))
+      Array.from({ length: Math.ceil(total_amount / limit) - 1 }, (_, i) =>
+        fetchZones((i + 1) * limit)
+      )
     );
 
-    return rest.reduce((acc, cur) => acc.concat(cur.data.results), results);
+    return rest.reduce((acc, cur) => acc.concat(cur.data.zones), zones);
   }
 
   private prepareTargets(targets: GCQuery[]): GCQuery[] {
@@ -91,21 +92,24 @@ export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
     options: DataQueryRequest<GCQuery>,
     query: GCQuery
   ): Promise<DataFrame> {
-    if (!data || data.length === 0) {
-      return getEmptyDataFrame();
-    }
+    if (!data || data.length === 0) return getEmptyDataFrame();
 
     const fields: Field[] = [];
     const firstRow = data[0];
     const [unit, transformFn] = getUnit(query, data);
+
     const bucketSizeMs =
       query.granularity?.value !== undefined
-        ? getSecondsByGranularity(query.granularity.value as unknown as GCGranularity) * 1000
+        ? getSecondsByGranularity(query.granularity.value as unknown as GCGranularity) *
+          1000
         : 5 * 60 * 1000;
 
-    const normalizeTs = (ts: number): number => (ts > 1e12 ? ts : ts * 1000);
+    const normalizeTs = (ts: number) => (ts > 1e12 ? ts : ts * 1000);
+
     const rawPoints: GCPoint[] = firstRow.requests
-      ? Object.entries(firstRow.requests).map(([ts, v]) => [normalizeTs(Number(ts)), Number(v)] as GCPoint)
+      ? Object.entries(firstRow.requests).map(
+          ([ts, v]) => [normalizeTs(Number(ts)), Number(v)] as GCPoint
+        )
       : [];
 
     const bucketMap = new Map<number, number>();
@@ -114,24 +118,34 @@ export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
       bucketMap.set(bucket, (bucketMap.get(bucket) || 0) + value);
     });
 
-    const bucketedData: GCPoint[] = Array.from(bucketMap.entries()).sort((a, b) => a[0] - b[0]);
+    const bucketedData: GCPoint[] = Array.from(bucketMap.entries()).sort(
+      (a, b) => a[0] - b[0]
+    );
     fields.push(getTimeField(bucketedData, true));
 
     for (const row of data) {
-      const rawLabels: Labels = { zone: query.zone ?? "", record_type: query.record_type ?? "" };
+      const rawLabels: Labels = {
+        zone: query.zone ?? "",
+        record_type: query.record_type ?? "",
+      };
 
       const metricsData: Map<number, number> = row.requests
         ? Object.entries(row.requests).reduce((acc, [ts, v]) => {
             const normalized = normalizeTs(Number(ts));
             const bucket = Math.floor(normalized / bucketSizeMs) * bucketSizeMs;
-            const prev = acc.get(bucket) || 0;
-            acc.set(bucket, prev + Number(v));
+            acc.set(bucket, (acc.get(bucket) || 0) + Number(v));
             return acc;
           }, new Map<number, number>())
         : new Map();
 
-      const finalData: GCPoint[] = Array.from(metricsData.entries()).sort((a, b) => a[0] - b[0]);
-      const { name, labels } = createLabelInfo(rawLabels, query, options.scopedVars);
+      const finalData: GCPoint[] = Array.from(metricsData.entries()).sort(
+        (a, b) => a[0] - b[0]
+      );
+      const { name, labels } = createLabelInfo(
+        rawLabels,
+        query,
+        options.scopedVars
+      );
 
       fields.push(
         getValueField({
@@ -148,21 +162,33 @@ export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
     return toDataFrame({ fields, refId: query.refId });
   }
 
-  async query(options: DataQueryRequest<GCQuery>): Promise<DataQueryResponse> {
-    const targets = this.prepareTargets(options.targets.filter((t) => !t.hide));
-    const promises = targets.map(async (query) => {
-      const resp = await this.doRequest(options, query);
-      const data: GCResponseStats[] = resp.data ? [resp.data] : [];
-      return this.transform(data, options, query);
-    });
-    const frames = await Promise.all(promises);
-    return { data: frames, key: options.requestId, state: LoadingState.Done };
+  async query(
+    options: DataQueryRequest<GCQuery>
+  ): Promise<DataQueryResponse> {
+    const targets = this.prepareTargets(
+      options.targets.filter((t) => !t.hide)
+    );
+
+    const frames = await Promise.all(
+      targets.map(async (query) => {
+        const resp = await this.doRequest(options, query);
+        const data: GCResponseStats[] = resp.data ? [resp.data] : [];
+        return this.transform(data, options, query);
+      })
+    );
+
+    return {
+      data: frames,
+      key: options.requestId,
+      state: LoadingState.Done,
+    };
   }
 
-  private async doRequest(options: DataQueryRequest<GCQuery>, query: GCQuery): Promise<{ data: GCResponseStats }> {
-    if (!query.zone) {
-      throw new Error("Zone is required");
-    }
+  private async doRequest(
+    options: DataQueryRequest<GCQuery>,
+    query: GCQuery
+  ): Promise<{ data: GCResponseStats }> {
+    if (!query.zone) throw new Error("Zone is required");
 
     const { range } = options;
     const zoneName = query.zone === "all" ? "all" : query.zone;
@@ -172,13 +198,14 @@ export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
       to: Math.floor((range?.to.valueOf() ?? 0) / 1000),
     };
 
-
     if (query.record_type && query.record_type !== GCDNSRecordType.All) {
       params.record_type = query.record_type;
     }
 
     if (query.granularity?.value !== undefined) {
-      params.granularity = getSecondsByGranularity(query.granularity.value as unknown as GCGranularity);
+      params.granularity = getSecondsByGranularity(
+        query.granularity.value as unknown as GCGranularity
+      );
     }
 
     return getBackendSrv().datasourceRequest({
@@ -189,23 +216,36 @@ export class DataSource extends DataSourceApi<GCQuery, GCDataSourceOptions> {
     });
   }
 
+  // ✅ NEW TEST FUNCTION HERE
   async testDatasource(): Promise<{ status: string; message: string }> {
-    try {
-      const now = Math.floor(Date.now() / 1000);
-      const resp = await getBackendSrv().datasourceRequest({
+    const auth = async (path: string) =>
+      getBackendSrv().datasourceRequest({
         method: "GET",
-        url: `${this.url}/zones/all/statistics`,
+        url: `/api/datasources/proxy/uid/${this.instanceSettings.uid}/${path}`,
         responseType: "json",
-        params: { from: now - 3600, to: now },
+        showErrorAlert: true,
       });
 
-      return resp.status === 200
-        ? { status: "success", message: "Successfully connected to DNS API." }
-        : { status: "error", message: "Failed to connect to DNS API." };
-    } catch (e: unknown) {
-      const err = e as any;
-      const message = err.data?.message || err.statusText || "Connection failed.";
-      return { status: "error", message };
+    try {
+      const r1 = await auth("iam/users/me");
+      return {
+        status: "success",
+        message: `Auth OK (IAM): ${(r1.data as { name?: string })?.name ?? "OK"}`,
+      };
+    } catch {
+      try {
+        const r2 = await auth("users/me");
+        return {
+          status: "success",
+          message: `Auth OK: ${(r2.data as { name?: string })?.name ?? "OK"}`,
+        };
+      } catch (err: any) {
+        const msg =
+          err?.data?.message ||
+          err?.statusText ||
+          "Failed to authenticate. Check URL, API key, or network.";
+        return { status: "error", message: msg };
+      }
     }
   }
 }
